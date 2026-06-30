@@ -2,6 +2,12 @@
 
 Generic RAG-based AI assistant for any documentation site. Point it at a URL, ingest, and query.
 
+## Video
+
+
+https://github.com/user-attachments/assets/9e2e3e08-44ea-4834-bd52-c75890adc05d
+
+
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
