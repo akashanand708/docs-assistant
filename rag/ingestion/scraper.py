@@ -1,4 +1,4 @@
-"""Web scraper for PingIdentity documentation site."""
+"""Web scraper for documentation sites."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from rich.console import Console
 from tqdm import tqdm
 
-from . import config
+from .. import config
 
 console = Console()
 
@@ -35,7 +35,7 @@ class ScrapedPage:
 
 
 class DocsScraper:
-    """Scraper for PingIdentity documentation site."""
+    """Scraper for a documentation site."""
 
     def __init__(
         self,
@@ -49,9 +49,7 @@ class DocsScraper:
         self.visited: set[str] = set()
         self.session = requests.Session()
         self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (compatible; PingIDDocsAssistant/1.0; Documentation Scraper)"
-            }
+            {"User-Agent": "Mozilla/5.0 (compatible; DocsAssistant/1.0; Documentation Scraper)"}
         )
 
     def _normalize_url(self, url: str) -> str:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI interface for PingIdentity Documentation Assistant."""
+"""CLI interface for Documentation Assistant."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from rich.console import Console
 from rag import config
 
 app = typer.Typer(
-    name="pingid-assistant",
-    help="AI assistant for PingIdentity documentation",
+    name="docs-assistant",
+    help="AI assistant for documentation",
     add_completion=False,
 )
 console = Console()
@@ -68,7 +68,7 @@ def ingest(
     generates embeddings, and stores them in a ChromaDB vector database.
 
     Args:
-        url: Base URL of the documentation site (e.g., https://docs.pingidentity.com)
+        url: Base URL of the documentation site (e.g., https://docs.example.com)
         max_pages: Maximum number of pages to crawl (use -1 for unlimited)
         chunk_size: Size of text chunks in characters for splitting documents
         chunk_overlap: Number of overlapping characters between consecutive chunks
@@ -77,12 +77,13 @@ def ingest(
         force: If True, deletes existing vector store before ingesting
 
     Example:
-        $ python main.py ingest --url https://docs.pingidentity.com --max-pages 100
+        $ python main.py ingest --url https://docs.example.com --max-pages 100
         $ python main.py ingest --force  # Re-ingest from scratch
     """
-    from rag.processor import process_scraped_pages
-    from rag.scraper import DocsScraper
-    from rag.vector_store import create_vector_store, delete_vector_store
+    import json
+
+    from rag.ingestion.scraper import DocsScraper
+    from rag.ingestion.vector_store import delete_vector_store
 
     if force:
         delete_vector_store(persist_dir)
@@ -95,37 +96,72 @@ def ingest(
         console.print("[red]No pages scraped. Check the URL and try again.[/red]")
         raise typer.Exit(1)
 
-    console.print(f"\n[bold]Step 2/3: Processing {len(pages)} pages into chunks...[/bold]")
-    documents = process_scraped_pages(
-        pages,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
+    persist_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save chunks to file for recovery
-    import json
+    if config.USE_PARENT_RETRIEVER:
+        from rag.ingestion.processor import pages_to_documents
+        from rag.ingestion.vector_store import create_parent_retriever
 
-    persist_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
-    chunks_file = persist_dir / "pending_chunks.json"
-    chunks_data = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
-    with open(chunks_file, "w") as f:
-        json.dump(chunks_data, f)
-    console.print(f"[dim]Saved {len(documents)} chunks to {chunks_file}[/dim]")
+        console.print(f"\n[bold]Step 2/3: Converting {len(pages)} pages to documents...[/bold]")
+        documents = pages_to_documents(pages)
 
-    console.print("\n[bold]Step 3/3: Creating vector embeddings...[/bold]")
-    create_vector_store(
-        documents=documents,
+        # Save for recovery in case indexing is interrupted
+        pages_file = persist_dir / "pending_pages.json"
+        pages_data = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
+        with open(pages_file, "w") as f:
+            json.dump(pages_data, f)
+        console.print(f"[dim]Saved {len(documents)} page documents to {pages_file}[/dim]")
+
+        console.print("\n[bold]Step 3/3: Building parent-child index...[/bold]")
+        create_parent_retriever(
+            documents=documents,
+            collection_name=collection,
+            persist_directory=persist_dir,
+        )
+        pages_file.unlink(missing_ok=True)
+
+        console.print("\n[bold green]✓ Ingestion complete![/bold green]")
+        console.print(f"  Pages scraped:    {len(pages)}")
+        console.print("  Index type:       ParentDocumentRetriever")
+        console.print(f"  Vector store:     {persist_dir}")
+        console.print(f"  Parent store:     {config.PARENT_STORE_DIR}")
+    else:
+        from rag.ingestion.processor import process_scraped_pages
+        from rag.ingestion.vector_store import create_vector_store
+
+        console.print(f"\n[bold]Step 2/3: Processing {len(pages)} pages into chunks...[/bold]")
+        documents = process_scraped_pages(
+            pages,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+
+        # Save chunks for recovery
+        chunks_file = persist_dir / "pending_chunks.json"
+        chunks_data = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
+        with open(chunks_file, "w") as f:
+            json.dump(chunks_data, f)
+        console.print(f"[dim]Saved {len(documents)} chunks to {chunks_file}[/dim]")
+
+        console.print("\n[bold]Step 3/3: Creating vector embeddings...[/bold]")
+        create_vector_store(
+            documents=documents,
+            collection_name=collection,
+            persist_directory=persist_dir,
+        )
+        chunks_file.unlink(missing_ok=True)
+
+        console.print("\n[bold green]✓ Ingestion complete![/bold green]")
+        console.print(f"  Pages scraped:    {len(pages)}")
+        console.print(f"  Document chunks:  {len(documents)}")
+        console.print(f"  Vector store:     {persist_dir}")
+
+    from rag.evaluator import generate_testset
+
+    generate_testset(
         collection_name=collection,
         persist_directory=persist_dir,
     )
-
-    # Remove pending chunks file on success
-    chunks_file.unlink(missing_ok=True)
-
-    console.print("\n[bold green]✓ Ingestion complete![/bold green]")
-    console.print(f"  Pages scraped: {len(pages)}")
-    console.print(f"  Document chunks: {len(documents)}")
-    console.print(f"  Vector store: {persist_dir}")
 
 
 @app.command()
@@ -168,39 +204,71 @@ def embed(
 
     from langchain_core.documents import Document
 
-    from rag.vector_store import create_vector_store
+    if config.USE_PARENT_RETRIEVER:
+        from rag.ingestion.vector_store import create_parent_retriever
 
-    # Default to pending_chunks.json in persist directory
-    if chunks_file is None:
-        chunks_file = persist_dir / "pending_chunks.json"
+        # Default to pending_pages.json in parent retriever mode
+        if chunks_file is None:
+            chunks_file = persist_dir / "pending_pages.json"
 
-    if not chunks_file.exists():
-        console.print(f"[red]Chunks file not found: {chunks_file}[/red]")
-        console.print("[dim]Run 'ingest' first, or specify --chunks-file[/dim]")
-        raise typer.Exit(1)
+        if not chunks_file.exists():
+            console.print(f"[red]Pages file not found: {chunks_file}[/red]")
+            console.print("[dim]Run 'ingest' first, or specify --chunks-file[/dim]")
+            raise typer.Exit(1)
 
-    console.print(f"[bold]Loading chunks from {chunks_file}...[/bold]")
-    with open(chunks_file) as f:
-        chunks_data = json.load(f)
+        console.print(f"[bold]Loading page documents from {chunks_file}...[/bold]")
+        with open(chunks_file) as f:
+            pages_data = json.load(f)
 
-    documents = [
-        Document(page_content=chunk["content"], metadata=chunk["metadata"]) for chunk in chunks_data
-    ]
-    console.print(f"[green]Loaded {len(documents)} chunks[/green]")
+        documents = [
+            Document(page_content=p["content"], metadata=p["metadata"]) for p in pages_data
+        ]
+        console.print(f"[green]Loaded {len(documents)} page documents[/green]")
 
-    console.print("\n[bold]Creating vector embeddings...[/bold]")
-    create_vector_store(
-        documents=documents,
-        collection_name=collection,
-        persist_directory=persist_dir,
-    )
+        console.print("\n[bold]Building parent-child index...[/bold]")
+        create_parent_retriever(
+            documents=documents,
+            collection_name=collection,
+            persist_directory=persist_dir,
+        )
+        chunks_file.unlink(missing_ok=True)
 
-    # Remove pending chunks file on success
-    chunks_file.unlink(missing_ok=True)
+        console.print("\n[bold green]✓ Indexing complete![/bold green]")
+        console.print(f"  Page documents:  {len(documents)}")
+        console.print(f"  Parent store:    {config.PARENT_STORE_DIR}")
+    else:
+        from rag.ingestion.vector_store import create_vector_store
 
-    console.print("\n[bold green]✓ Embedding complete![/bold green]")
-    console.print(f"  Document chunks: {len(documents)}")
-    console.print(f"  Vector store: {persist_dir}")
+        # Default to pending_chunks.json in flat chunk mode
+        if chunks_file is None:
+            chunks_file = persist_dir / "pending_chunks.json"
+
+        if not chunks_file.exists():
+            console.print(f"[red]Chunks file not found: {chunks_file}[/red]")
+            console.print("[dim]Run 'ingest' first, or specify --chunks-file[/dim]")
+            raise typer.Exit(1)
+
+        console.print(f"[bold]Loading chunks from {chunks_file}...[/bold]")
+        with open(chunks_file) as f:
+            chunks_data = json.load(f)
+
+        documents = [
+            Document(page_content=chunk["content"], metadata=chunk["metadata"])
+            for chunk in chunks_data
+        ]
+        console.print(f"[green]Loaded {len(documents)} chunks[/green]")
+
+        console.print("\n[bold]Creating vector embeddings...[/bold]")
+        create_vector_store(
+            documents=documents,
+            collection_name=collection,
+            persist_directory=persist_dir,
+        )
+        chunks_file.unlink(missing_ok=True)
+
+        console.print("\n[bold green]✓ Embedding complete![/bold green]")
+        console.print(f"  Document chunks: {len(documents)}")
+        console.print(f"  Vector store:    {persist_dir}")
 
 
 @app.command()
@@ -227,7 +295,7 @@ def chat(
     """Start interactive chat with the documentation assistant.
 
     Launches an interactive terminal-based chat session where you can ask
-    questions about PingIdentity documentation. Uses RAG (Retrieval-Augmented
+    questions about the documentation. Uses RAG (Retrieval-Augmented
     Generation) to find relevant documentation and generate accurate answers.
 
     Args:
@@ -239,7 +307,7 @@ def chat(
         $ python main.py chat
         $ python main.py chat --sources  # Show source documents
     """
-    from rag.rag_chain import interactive_chat
+    from rag.query.rag_chain import interactive_chat
 
     interactive_chat(
         collection_name=collection,
@@ -279,6 +347,11 @@ def web(
         "-s",
         help="Show source documents with URLs after each response",
     ),
+    root_path: str = typer.Option(
+        "",
+        "--root-path",
+        help="Public base URL when behind a proxy/tunnel (e.g. ngrok URL)",
+    ),
 ) -> None:
     """Launch web UI for the documentation assistant.
 
@@ -297,7 +370,7 @@ def web(
         $ python main.py web --share --sources  # Public URL with sources
         $ python main.py web --port 8080
     """
-    from rag.web_ui import launch_web_ui
+    from rag.query.web_ui import launch_web_ui
 
     launch_web_ui(
         collection_name=collection,
@@ -305,12 +378,12 @@ def web(
         share=share,
         server_port=port,
         show_sources=show_sources,
+        root_path=root_path,
     )
 
 
-@app.command()
-def ask(
-    question: str = typer.Argument(..., help="Question to ask"),
+@app.command(name="gen-testset")
+def gen_testset(
     collection: str = typer.Option(
         config.COLLECTION_NAME,
         "--collection",
@@ -323,118 +396,35 @@ def ask(
         "-d",
         help="Directory where vector database is persisted",
     ),
-    show_sources: bool = typer.Option(
-        False,
-        "--sources",
-        "-s",
-        help="Display source documents with the response",
+    output: Path = typer.Option(
+        Path("eval_testset.json"),
+        "--output",
+        "-o",
+        help="Output path for the generated test set",
+    ),
+    n_pages: int = typer.Option(
+        20,
+        "--pages",
+        "-p",
+        help="Number of pages to sample from the index",
+    ),
+    questions_per_page: int = typer.Option(
+        2,
+        "--questions",
+        "-q",
+        help="Questions to generate per page",
     ),
 ) -> None:
-    """Ask a single question and get an answer.
+    """Generate an evaluation test set from the existing vector index."""
+    from rag.evaluator import generate_testset
 
-    Performs a one-shot RAG query against the documentation. Retrieves relevant
-    documents from the vector store and generates an answer using the LLM.
-
-    Args:
-        question: The question to ask about PingIdentity documentation
-        collection: Name of the ChromaDB collection containing embeddings
-        persist_dir: Directory where vector database is persisted
-        show_sources: If True, displays source URLs for retrieved documents
-
-    Example:
-        $ python main.py ask "How do I configure MFA?"
-        $ python main.py ask "What is PingFederate?" --sources
-    """
-    from rich.markdown import Markdown
-
-    from rag.rag_chain import query
-
-    result = query(
-        question=question,
+    generate_testset(
         collection_name=collection,
         persist_directory=persist_dir,
+        output_path=output,
+        n_pages=n_pages,
+        questions_per_page=questions_per_page,
     )
-
-    console.print(Markdown(result["answer"]))
-
-    if show_sources and result.get("context"):
-        console.print("\n[dim]Sources:[/dim]")
-        seen_sources = set()
-        for doc in result["context"]:
-            source = doc.metadata.get("source", "Unknown")
-            if source not in seen_sources:
-                seen_sources.add(source)
-                title = doc.metadata.get("title", "")
-                console.print(f"  [dim]• {title}[/dim]")
-                console.print(f"    {source}")
-
-
-@app.command()
-def search(
-    query_text: str = typer.Argument(..., help="Search query"),
-    top_k: int = typer.Option(
-        config.TOP_K_RESULTS,
-        "--top-k",
-        "-k",
-        help="Number of results to return",
-    ),
-    collection: str = typer.Option(
-        config.COLLECTION_NAME,
-        "--collection",
-        "-c",
-        help="ChromaDB collection name",
-    ),
-    persist_dir: Path = typer.Option(
-        config.CHROMA_PERSIST_DIR,
-        "--persist-dir",
-        "-d",
-        help="Directory where vector database is persisted",
-    ),
-) -> None:
-    """Search the vector database for similar documents.
-
-    Performs a semantic similarity search in the vector database without
-    generating an LLM response. Useful for debugging or exploring what
-    documents are retrieved for a given query.
-
-    Args:
-        query_text: The search query to find similar documents
-        top_k: Number of most similar results to return
-        collection: Name of the ChromaDB collection to search
-        persist_dir: Directory where vector database is persisted
-
-    Example:
-        $ python main.py search "MFA configuration"
-        $ python main.py search "OAuth setup" --top-k 10
-    """
-    from rag.vector_store import similarity_search
-
-    results = similarity_search(
-        query=query_text,
-        k=top_k,
-        collection_name=collection,
-        persist_directory=persist_dir,
-    )
-
-    if not results:
-        console.print("[yellow]No results found.[/yellow]")
-        return
-
-    console.print(f"[bold]Found {len(results)} results:[/bold]\n")
-
-    for i, doc in enumerate(results, 1):
-        source = doc.metadata.get("source", "Unknown")
-        title = doc.metadata.get("title", "Untitled")
-        chunk_idx = doc.metadata.get("chunk_index", 0)
-        total_chunks = doc.metadata.get("total_chunks", 1)
-
-        console.print(f"[bold cyan]{i}. {title}[/bold cyan]")
-        console.print(f"   [dim]Chunk {chunk_idx + 1}/{total_chunks} | {source}[/dim]")
-        # Show preview of content
-        preview = doc.page_content[:200].replace("\n", " ")
-        if len(doc.page_content) > 200:
-            preview += "..."
-        console.print(f"   {preview}\n")
 
 
 @app.command()
@@ -464,7 +454,7 @@ def status(
     Example:
         $ python main.py status
     """
-    from rag.vector_store import load_vector_store
+    from rag.ingestion.vector_store import load_vector_store
 
     try:
         vector_store = load_vector_store(collection, persist_dir)
@@ -475,10 +465,7 @@ def status(
         console.print(f"  Collection: {collection}")
         console.print(f"  Location: {persist_dir}")
         console.print(f"  Documents: {count}")
-        if config.USE_LOCAL_EMBEDDINGS:
-            console.print(f"  Embedding: local ({config.LOCAL_EMBEDDING_MODEL})")
-        else:
-            console.print(f"  Embedding: API ({config.EMBEDDING_MODEL})")
+        console.print(f"  Embedding: local ({config.LOCAL_EMBEDDING_MODEL})")
     except FileNotFoundError:
         console.print(f"[yellow]No vector store found at {persist_dir}[/yellow]")
         console.print("[dim]Run 'ingest' command to create one.[/dim]")
@@ -512,7 +499,7 @@ def clear(
         $ python main.py clear
         $ python main.py clear --force  # Skip confirmation
     """
-    from rag.vector_store import delete_vector_store
+    from rag.ingestion.vector_store import delete_vector_store
 
     if not force:
         confirm = typer.confirm(f"Delete vector store at {persist_dir}?")
@@ -520,6 +507,130 @@ def clear(
             raise typer.Abort()
 
     delete_vector_store(persist_dir)
+
+
+@app.command()
+def evaluate(
+    testset: Path = typer.Option(
+        Path("eval_testset.json"),
+        "--testset",
+        "-t",
+        help="Path to JSON test set file",
+    ),
+    collection: str = typer.Option(
+        config.COLLECTION_NAME,
+        "--collection",
+        "-c",
+        help="ChromaDB collection name",
+    ),
+    persist_dir: Path = typer.Option(
+        config.CHROMA_PERSIST_DIR,
+        "--persist-dir",
+        "-d",
+        help="Directory where vector database is persisted",
+    ),
+    top_k: int = typer.Option(
+        config.TOP_K_RESULTS,
+        "--top-k",
+        "-k",
+        help="Number of documents to retrieve per question",
+    ),
+    ragas: bool = typer.Option(
+        False,
+        "--ragas",
+        help="Also run RAGAS quality metrics (needs ground_truth in test set and pip install ragas)",
+    ),
+    output: Path = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Save results to this JSON file (default: eval_results.json next to testset)",
+    ),
+) -> None:
+    """Benchmark the RAG system accuracy.
+
+    Runs two benchmarks against a JSON test set:
+
+    \b
+    1. Hit Rate @k  (always)
+       Checks whether the correct documentation page appeared anywhere in the
+       top-k retrieved results.  Requires 'expected_url' in test cases.
+       → Hit Rate: fraction of questions answered correctly
+       → MRR:      mean reciprocal rank (rewards finding the right page higher)
+
+    \b
+    2. RAGAS metrics (only with --ragas flag)
+       Uses an LLM as judge to score generation quality.
+       Requires 'ground_truth' answers in test cases AND pip install ragas.
+       Metrics: context_precision, context_recall, faithfulness, answer_relevancy
+
+    \b
+    Test set format (JSON array):
+      [
+        {
+          "question":     "How do I configure OIDC?",
+          "expected_url": "oidc",    // substring match
+          "ground_truth": "To configure OIDC..."  // for --ragas only
+        }
+      ]
+
+    \b
+    Examples:
+      python main.py evaluate                          # hit rate only (fast)
+      python main.py evaluate --ragas                  # + RAGAS (slow, uses LLM)
+      python main.py evaluate --testset my_tests.json  # custom test set
+      python main.py evaluate --top-k 10               # test with k=10
+    """
+    from rag.evaluator import (
+        load_testset,
+        print_hit_rate_table,
+        print_ragas_table,
+        run_hit_rate,
+        run_ragas,
+        save_results,
+    )
+
+    if not testset.exists():
+        console.print(f"[red]Test set not found: {testset}[/red]")
+        console.print(
+            "[dim]Create a JSON file with questions and expected_url fields, "
+            "or point --testset at an existing file.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    index_mode = "ParentDocumentRetriever" if config.USE_PARENT_RETRIEVER else "Flat chunks (MMR)"
+    console.print("\n[bold]Documentation Assistant — Benchmark[/bold]")
+    console.print(f"  Index mode:  {index_mode}")
+    console.print(f"  Top-k:       {top_k}")
+    console.print(f"  Test set:    {testset}")
+    console.print(f"  RAGAS:       {'yes' if ragas else 'no (use --ragas to enable)'}")
+
+    cases = load_testset(testset)
+
+    # ── Benchmark 1: Hit Rate ────────────────────────────────────────────
+    hit_rate_result = run_hit_rate(
+        cases=cases,
+        k=top_k,
+        collection_name=collection,
+        persist_directory=persist_dir,
+    )
+    print_hit_rate_table(hit_rate_result)
+
+    # ── Benchmark 2: RAGAS ──────────────────────────────────────────────
+    ragas_scores: dict = {}
+    if ragas:
+        ragas_scores = run_ragas(
+            cases=cases,
+            k=top_k,
+            collection_name=collection,
+            persist_directory=persist_dir,
+        )
+        print_ragas_table(ragas_scores)
+
+    # ── Save results ─────────────────────────────────────────────────────
+    if output is None:
+        output = testset.parent / "eval_results.json"
+    save_results(hit_rate_result, ragas_scores, output)
 
 
 if __name__ == "__main__":

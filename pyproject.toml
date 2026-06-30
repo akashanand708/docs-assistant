@@ -1,7 +1,7 @@
 [project]
-name = "pingid-docs-assistant"
+name = "docs-assistant"
 version = "1.0.0"
-description = "AI assistant for PingIdentity documentation"
+description = "Generic AI assistant for any documentation site"
 requires-python = ">=3.10"
 
 [tool.ruff]

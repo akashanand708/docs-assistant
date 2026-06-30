@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rich.console import Console
 
-from . import config
+from .. import config
 
 if TYPE_CHECKING:
     from .scraper import ScrapedPage
@@ -86,4 +86,33 @@ def process_scraped_pages(
         f"[bold green]Created {len(documents)} document chunks from {len(pages)} pages[/bold green]"
     )
 
+    return documents
+
+
+def pages_to_documents(pages: list[ScrapedPage]) -> list[Document]:
+    """Convert scraped pages to full-page Documents without chunking.
+
+    Used as input to ParentDocumentRetriever. The retriever itself handles
+    splitting into parent sections and child chunks internally.
+
+    Args:
+        pages: List of scraped pages from the web scraper
+
+    Returns:
+        List of LangChain Document objects — one per page, full content preserved
+    """
+    documents: list[Document] = []
+
+    console.print(f"[bold blue]Converting {len(pages)} pages to documents...[/bold blue]")
+
+    for page in pages:
+        full_text = page.to_document_text()
+        metadata = {
+            "source": page.url,
+            "title": page.title,
+            "breadcrumbs": " > ".join(page.breadcrumbs) if page.breadcrumbs else "",
+        }
+        documents.append(Document(page_content=full_text, metadata=metadata))
+
+    console.print(f"[bold green]Created {len(documents)} page documents (no chunking)[/bold green]")
     return documents
